@@ -1,0 +1,15 @@
+{
+  "repository": "Minato-256/GriefGuard",
+  "asset": "GriefGuard-ProxyBridge.jar",
+  "checksumAsset": "SHA256SUMS",
+  "supportedEditions": [
+    "standard",
+    "high"
+  ],
+  "protocolVersion": 1,
+  "minimumNodeMajor": 18,
+  "releaseAsset": "GriefGuard-ProxyBridge.jar",
+  "releaseReady": true,
+  "builtAt": "2026-08-04T17:15:53.817Z",
+  "sha256": "710a558ec92d4a01f0dd2876784169375c54ff5697aa40c22cb381170a6a2059"
+}
