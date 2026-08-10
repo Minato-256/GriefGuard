@@ -18,12 +18,16 @@ AGENT_HOST="${GRIEFGUARD_AGENT_HOST:-}"
 AGENT_PORT="${GRIEFGUARD_AGENT_PORT:-25502}"
 PROXY_ID="${GRIEFGUARD_PROXY_ID:-}"
 TOKEN="${GRIEFGUARD_PROXY_TOKEN:-}"
+OFFLINE=0
 
 usage() {
   cat <<'EOF'
 GriefGuard ProxyBridge GitHub セットアップ
 
 GitHubから最新のProxyBridgeを取得し、現在のProxyへ自動配置します。
+
+Proxyルートは、Proxy本体のJAR・設定ファイル・plugins/またはextensions/が
+同じ階層にあるフォルダーです。/root、/home、/optなどの親フォルダーは指定しません。
 
 引数（省略すると画面で質問します）:
   --platform velocity|bungee|geyser
@@ -34,7 +38,13 @@ GitHubから最新のProxyBridgeを取得し、現在のProxyへ自動配置し�
   --agent-port <Agent待受ポート（既定25502）>
   --proxy-id <アプリ発行Proxy ID>
   --token <アプリ発行Token>
+  --offline                          GitHubへ接続せず、スクリプトと同じフォルダーのJARを使用
   --help
+
+種類の目印:
+  Velocity: velocity.toml または Velocity*.jar / plugins/
+  BungeeCord・Waterfall: config.yml・bungee.yml または BungeeCord/Waterfall*.jar / plugins/
+  Geyser: extensions/ または Geyser*.jar / extensions/
 
 1行実行例:
   tmp=$(mktemp "${TMPDIR:-/tmp}/griefguard-proxy.XXXXXX") && trap 'rm -f "$tmp"' EXIT && curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Minato-256/GriefGuard/main/proxy-install.sh -o "$tmp" && sh "$tmp"
@@ -51,6 +61,7 @@ while [ "$#" -gt 0 ]; do
     --agent-port) AGENT_PORT="${2:-}"; shift 2 ;;
     --proxy-id) PROXY_ID="${2:-}"; shift 2 ;;
     --token) TOKEN="${2:-}"; shift 2 ;;
+    --offline) OFFLINE=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "[ERROR] 不明な引数です: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -87,6 +98,87 @@ detect_platform() {
   printf '%s' ""
 }
 
+platform_label() {
+  case "$1" in
+    velocity) printf '%s' 'Velocity（Java版プロキシ）' ;;
+    bungee) printf '%s' 'BungeeCord / Waterfall（Java版プロキシ）' ;;
+    geyser) printf '%s' 'Geyser（統合版接続用）' ;;
+    *) printf '%s' '不明なプロキシ' ;;
+  esac
+}
+
+platform_guide() {
+  cat >&2 <<'EOF'
+
+Proxyルートフォルダーの選び方:
+  1. Proxy本体のJAR、設定ファイル、plugins/またはextensions/が同じ階層にある場所を選びます。
+  2. plugins/やextensions/だけを選ばず、その一つ上のフォルダーを選びます。
+  3. /root、/home、/opt、/srvなどの親フォルダーは選びません。
+
+種類と必要な目印:
+  1: Velocity（Java版プロキシ）      velocity.toml または Velocity*.jar / plugins/
+  2: BungeeCord・Waterfall（Java版） config.yml・bungee.yml または BungeeCord/Waterfall*.jar / plugins/
+  3: Geyser（統合版接続用）           extensions/ または Geyser*.jar / extensions/
+
+例: /home/minecraft/velocity、/home/minecraft/waterfall、/home/minecraft/geyser
+EOF
+}
+
+has_proxy_jar() {
+  root="$1"
+  kind="$2"
+  for jar in "$root"/*.jar; do
+    [ -f "$jar" ] || continue
+    name=$(basename "$jar")
+    case "$kind:$name" in
+      velocity:velocity*.jar|velocity:Velocity*.jar) return 0 ;;
+      bungee:waterfall*.jar|bungee:Waterfall*.jar|bungee:bungeecord*.jar|bungee:BungeeCord*.jar|bungee:bungee*.jar|bungee:Bungee*.jar) return 0 ;;
+      geyser:geyser*.jar|geyser:Geyser*.jar) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+is_broad_root() {
+  case "$1" in
+    /|/root|/home|/opt|/srv|/usr|/var|/tmp) return 0 ;;
+  esac
+  return 1
+}
+
+validate_proxy_root() {
+  root="$1"
+  kind="$2"
+  label=$(platform_label "$kind")
+  case "$kind" in
+    velocity) base_ok=0; [ -f "$root/velocity.toml" ] || has_proxy_jar "$root" velocity || base_ok=1; install_dir="$root/plugins" ;;
+    bungee) base_ok=0; [ -f "$root/config.yml" ] || [ -f "$root/bungee.yml" ] || has_proxy_jar "$root" bungee || base_ok=1; install_dir="$root/plugins" ;;
+    geyser) base_ok=0; [ -d "$root/extensions" ] || has_proxy_jar "$root" geyser || base_ok=1; install_dir="$root/extensions" ;;
+    *) echo '[ERROR] プロキシ種類が不正です。' >&2; return 1 ;;
+  esac
+  echo >&2
+  echo "[確認] 選択したProxyルート: $root" >&2
+  echo "  種類: $label" >&2
+  echo "  配置先: $install_dir" >&2
+  if [ "$base_ok" -eq 0 ]; then echo '  ✓ Proxy本体・設定ファイル: 確認できました' >&2; else echo '  ✗ Proxy本体・設定ファイル: 見つかりません' >&2; fi
+  if [ -d "$install_dir" ]; then echo "  ✓ $(basename "$install_dir")/: 確認できました" >&2; else echo "  △ $(basename "$install_dir")/: 無いためインストーラーが作成します" >&2; fi
+  contents=''
+  for entry in "$root"/*; do
+    [ -e "$entry" ] || continue
+    contents="$contents\n    $(basename "$entry")"
+  done
+  if [ -n "$contents" ]; then printf '  フォルダー内の主な項目:%b\n' "$contents" >&2; fi
+  if [ "$base_ok" -ne 0 ]; then
+    if is_broad_root "$root"; then
+      echo "[ERROR] $root は親フォルダーです。${label}のファイルが直接入る一つ下のフォルダーを選択してください。" >&2
+    else
+      echo "[ERROR] $root は${label}のルートとして確認できません。必要なファイルを確認してください。" >&2
+    fi
+    return 1
+  fi
+  return 0
+}
+
 discover_root() {
   for candidate in "$(pwd)" "${GRIEFGUARD_PROXY_ROOT:-}"; do
     [ -n "$candidate" ] || continue
@@ -99,7 +191,7 @@ discover_root() {
       detected=$(detect_platform "$candidate")
       if [ -n "$detected" ]; then printf '%s' "$candidate"; return 0; fi
     done <<EOF
-$(find "$base" -maxdepth 4 \( -type f \( -name velocity.toml -o -name bungee.yml \) -o -type d -name extensions \) -print 2>/dev/null | sed 's#/[^/]*$##' | head -20)
+$(find "$base" -maxdepth 4 \( -type f \( -name velocity.toml -o -name bungee.yml -iname 'velocity*.jar' -o -iname 'waterfall*.jar' -o -iname 'bungeecord*.jar' -o -iname 'Geyser*.jar' \) -o -type d -name extensions \) -print 2>/dev/null | sed 's#/[^/]*$##' | head -20)
 EOF
   done
   return 1
@@ -116,9 +208,11 @@ if [ -z "$TARGET" ]; then
   if [ -n "$discovered" ] && [ -n "$detected" ]; then
     TARGET="$discovered"
     PLATFORM="$detected"
+    echo "[AUTO] Proxy種類を検出しました: $(platform_label "$PLATFORM")"
     echo "[AUTO] Proxyルートを検出しました: $TARGET"
   else
-    TARGET=$(ask 'Proxyルートフォルダー（velocity.toml / bungee.yml / plugins がある場所）' "$(pwd)")
+    platform_guide
+    TARGET=$(ask 'Proxyルートフォルダー（例: /home/minecraft/velocity）' '')
   fi
 fi
 if ! valid_dir "$TARGET"; then
@@ -132,10 +226,14 @@ if [ "$PLATFORM" = waterfall ]; then PLATFORM=bungee; fi
 case "$PLATFORM" in
   velocity|bungee|geyser) ;;
   *)
-    PLATFORM=$(ask '種類 (1: Velocity / 2: BungeeCord・Waterfall / 3: Geyser)' 1)
+    platform_guide
+    PLATFORM=$(ask '種類の番号 (1: Velocity / 2: BungeeCord・Waterfall / 3: Geyser)' '')
     case "$PLATFORM" in 1) PLATFORM=velocity ;; 2) PLATFORM=bungee ;; 3) PLATFORM=geyser ;; *) echo '[ERROR] 種類は1、2、3のいずれかです。' >&2; exit 13 ;; esac
     ;;
 esac
+
+validate_proxy_root "$TARGET" "$PLATFORM" || exit 12
+echo "[OK] $(platform_label "$PLATFORM")として認識しました。" >&2
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 json_field() {
@@ -182,11 +280,23 @@ download() {
   url="$1"; output="$2"
   if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 --connect-timeout 15 "$url" -o "$output"; else wget -q --tries=2 -O "$output" "$url"; fi
 }
-echo "[RUN] GitHubからProxyBridgeを取得しています: $REPOSITORY"
-if ! download "$RELEASE_BASE/GriefGuard-ProxyBridge.jar" "$jar" 2>/dev/null || ! download "$RELEASE_BASE/SHA256SUMS" "$sums" 2>/dev/null; then
+if [ "$OFFLINE" -eq 1 ]; then
+  echo '[RUN] 同梱ProxyBridgeを確認しています。'
+  script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+  if [ ! -f "$script_dir/GriefGuard-ProxyBridge.jar" ] || [ ! -f "$script_dir/SHA256SUMS" ]; then
+    echo '[ERROR] --offlineにはproxy-install.sh、GriefGuard-ProxyBridge.jar、SHA256SUMSを同じフォルダーへ置いてください。' >&2
+    exit 18
+  fi
+  cp "$script_dir/GriefGuard-ProxyBridge.jar" "$jar"
+  cp "$script_dir/SHA256SUMS" "$sums"
+  echo '[OK] 同じフォルダーのProxyBridgeを使用します（オフライン）。'
+elif ! download "$RELEASE_BASE/GriefGuard-ProxyBridge.jar" "$jar" 2>/dev/null || ! download "$RELEASE_BASE/SHA256SUMS" "$sums" 2>/dev/null; then
+  echo "[RUN] GitHubからProxyBridgeを取得しています: $REPOSITORY"
   echo '[INFO] Releasesに見つからないため、リポジトリ直下のファイルを使用します。'
   download "$RAW_BASE/GriefGuard-ProxyBridge.jar" "$jar"
   download "$RAW_BASE/SHA256SUMS" "$sums"
+else
+  echo "[RUN] GitHubからProxyBridgeを取得しています: $REPOSITORY"
 fi
 expected=$(awk '$NF == "GriefGuard-ProxyBridge.jar" || $NF == "*GriefGuard-ProxyBridge.jar" { print $1; exit }' "$sums")
 case "$expected" in [A-Fa-f0-9][A-Fa-f0-9]*) ;; *) echo '[ERROR] SHA256SUMSにProxyBridgeのハッシュがありません。' >&2; exit 18 ;; esac
