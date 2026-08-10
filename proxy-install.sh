@@ -1,0 +1,231 @@
+#!/bin/sh
+# GriefGuard ProxyBridge one-line bootstrap.
+#
+# This file is intentionally dependency-light so a rental VPS can install the
+# connector without first copying Mobile-Manager-Agent or installing Node.js.
+# Upload this file to the GitHub repository root as proxy-install.sh, then run:
+#   tmp=$(mktemp "${TMPDIR:-/tmp}/griefguard-proxy.XXXXXX") && trap 'rm -f "$tmp"' EXIT && curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Minato-256/GriefGuard/main/proxy-install.sh -o "$tmp" && sh "$tmp"
+set -eu
+
+REPOSITORY="${GRIEFGUARD_GITHUB_REPO:-Minato-256/GriefGuard}"
+RELEASE_BASE="https://github.com/${REPOSITORY}/releases/latest/download"
+RAW_BASE="https://raw.githubusercontent.com/${REPOSITORY}/main"
+PLATFORM=""
+TARGET="${GRIEFGUARD_PROXY_ROOT:-}"
+AGENT_URL="${GRIEFGUARD_AGENT_URL:-}"
+SETUP_CODE="${GRIEFGUARD_PROXY_SETUP_CODE:-}"
+AGENT_HOST="${GRIEFGUARD_AGENT_HOST:-}"
+AGENT_PORT="${GRIEFGUARD_AGENT_PORT:-25502}"
+PROXY_ID="${GRIEFGUARD_PROXY_ID:-}"
+TOKEN="${GRIEFGUARD_PROXY_TOKEN:-}"
+
+usage() {
+  cat <<'EOF'
+GriefGuard ProxyBridge GitHub セットアップ
+
+GitHubから最新のProxyBridgeを取得し、現在のProxyへ自動配置します。
+
+引数（省略すると画面で質問します）:
+  --platform velocity|bungee|geyser
+  --target <Proxyルート>
+  --agent-url <Agent HTTPS URL>
+  --setup-code <アプリ発行の一時コード>
+  --agent-host <AgentのTailscale IPまたはDNS>
+  --agent-port <Agent待受ポート（既定25502）>
+  --proxy-id <アプリ発行Proxy ID>
+  --token <アプリ発行Token>
+  --help
+
+1行実行例:
+  tmp=$(mktemp "${TMPDIR:-/tmp}/griefguard-proxy.XXXXXX") && trap 'rm -f "$tmp"' EXIT && curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Minato-256/GriefGuard/main/proxy-install.sh -o "$tmp" && sh "$tmp"
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --platform) PLATFORM="${2:-}"; shift 2 ;;
+    --target) TARGET="${2:-}"; shift 2 ;;
+    --agent-url) AGENT_URL="${2:-}"; shift 2 ;;
+    --setup-code) SETUP_CODE="${2:-}"; shift 2 ;;
+    --agent-host) AGENT_HOST="${2:-}"; shift 2 ;;
+    --agent-port) AGENT_PORT="${2:-}"; shift 2 ;;
+    --proxy-id) PROXY_ID="${2:-}"; shift 2 ;;
+    --token) TOKEN="${2:-}"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "[ERROR] 不明な引数です: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+ask() {
+  prompt="$1"
+  default="${2:-}"
+  if [ -n "$default" ]; then
+    printf '%s [%s]: ' "$prompt" "$default" >&2
+  else
+    printf '%s: ' "$prompt" >&2
+  fi
+  IFS= read -r answer || answer=""
+  if [ -n "$answer" ]; then printf '%s' "$answer"; else printf '%s' "$default"; fi
+}
+
+valid_dir() { [ -n "$1" ] && [ -d "$1" ]; }
+
+detect_platform() {
+  root="$1"
+  if [ -f "$root/velocity.toml" ]; then printf '%s' velocity; return; fi
+  if [ -f "$root/bungee.yml" ]; then printf '%s' bungee; return; fi
+  if [ -d "$root/extensions" ] && [ ! -f "$root/bungee.yml" ]; then printf '%s' geyser; return; fi
+  if [ -d "$root/plugins" ]; then
+    for jar in "$root"/*.jar; do
+      name=$(basename "$jar" 2>/dev/null || true)
+      case "$name" in
+        velocity*.jar|Velocity*.jar) printf '%s' velocity; return ;;
+        waterfall*.jar|Waterfall*.jar|bungeecord*.jar|BungeeCord*.jar|bungee*.jar|Bungee*.jar) printf '%s' bungee; return ;;
+      esac
+    done
+  fi
+  printf '%s' ""
+}
+
+discover_root() {
+  for candidate in "$(pwd)" "${GRIEFGUARD_PROXY_ROOT:-}"; do
+    [ -n "$candidate" ] || continue
+    detected=$(detect_platform "$candidate")
+    if [ -n "$detected" ]; then printf '%s' "$candidate"; return 0; fi
+  done
+  for base in "$HOME" /home /opt /srv; do
+    [ -d "$base" ] || continue
+    while IFS= read -r candidate; do
+      detected=$(detect_platform "$candidate")
+      if [ -n "$detected" ]; then printf '%s' "$candidate"; return 0; fi
+    done <<EOF
+$(find "$base" -maxdepth 4 \( -type f \( -name velocity.toml -o -name bungee.yml \) -o -type d -name extensions \) -print 2>/dev/null | sed 's#/[^/]*$##' | head -20)
+EOF
+  done
+  return 1
+}
+
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+  echo '[ERROR] curlまたはwgetが必要です。Ubuntuなら sudo apt-get install curl を実行してください。' >&2
+  exit 11
+fi
+
+if [ -z "$TARGET" ]; then
+  discovered=$(discover_root || true)
+  detected=$(detect_platform "$discovered")
+  if [ -n "$discovered" ] && [ -n "$detected" ]; then
+    TARGET="$discovered"
+    PLATFORM="$detected"
+    echo "[AUTO] Proxyルートを検出しました: $TARGET"
+  else
+    TARGET=$(ask 'Proxyルートフォルダー（velocity.toml / bungee.yml / plugins がある場所）' "$(pwd)")
+  fi
+fi
+if ! valid_dir "$TARGET"; then
+  echo "[ERROR] Proxyルートフォルダーが見つかりません: $TARGET" >&2
+  exit 12
+fi
+TARGET=$(CDPATH= cd -- "$TARGET" && pwd)
+
+if [ -z "$PLATFORM" ]; then PLATFORM=$(detect_platform "$TARGET"); fi
+if [ "$PLATFORM" = waterfall ]; then PLATFORM=bungee; fi
+case "$PLATFORM" in
+  velocity|bungee|geyser) ;;
+  *)
+    PLATFORM=$(ask '種類 (1: Velocity / 2: BungeeCord・Waterfall / 3: Geyser)' 1)
+    case "$PLATFORM" in 1) PLATFORM=velocity ;; 2) PLATFORM=bungee ;; 3) PLATFORM=geyser ;; *) echo '[ERROR] 種類は1、2、3のいずれかです。' >&2; exit 13 ;; esac
+    ;;
+esac
+
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+json_field() {
+  value=$(printf '%s' "$2" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1)
+  if [ -z "$value" ]; then value=$(printf '%s' "$2" | sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p" | head -1); fi
+  printf '%s' "$value"
+}
+
+if [ -n "$SETUP_CODE" ]; then
+  [ -n "$AGENT_URL" ] || { echo '[ERROR] Agent HTTPS URLがありません。アプリで導入コマンドを再発行してください。' >&2; exit 14; }
+  case "$AGENT_URL" in http://*|https://*) ;; *) echo '[ERROR] Agent HTTPS URLの形式が不正です。' >&2; exit 14 ;; esac
+  display_name=$(basename "$TARGET")
+  payload=$(printf '{"code":"%s","platform":"%s","displayName":"%s"}' "$(json_escape "$SETUP_CODE")" "$(json_escape "$PLATFORM")" "$(json_escape "$display_name")")
+  exchange=$(curl -fsSL --connect-timeout 15 --max-time 30 -H 'Content-Type: application/json' -d "$payload" "${AGENT_URL%/}/api/proxy/setup/exchange" 2>/dev/null || true)
+  PROXY_ID=$(json_field proxyId "$exchange")
+  TOKEN=$(json_field token "$exchange")
+  AGENT_HOST=$(json_field agentHost "$exchange")
+  AGENT_PORT=$(json_field agentPort "$exchange")
+  AGENT_PORT=${AGENT_PORT:-25502}
+  if [ -z "$PROXY_ID" ] || [ -z "$TOKEN" ] || [ -z "$AGENT_HOST" ]; then
+    error=$(json_field error "$exchange")
+    echo "[ERROR] Agentへの自動登録に失敗しました: ${error:-接続できませんでした。Tailscale HTTPSとコードの期限を確認してください。}" >&2
+    exit 16
+  fi
+  echo "[OK] AgentへのProxy登録を完了しました: $PROXY_ID"
+else
+  AGENT_HOST=${AGENT_HOST:-$(ask 'Agentの待受アドレス（Agent PCのTailscale IP）' 127.0.0.1)}
+  AGENT_PORT=${AGENT_PORT:-$(ask 'Agent ProxyBridgeポート' 25502)}
+  PROXY_ID=${PROXY_ID:-$(ask 'アプリで発行したProxy ID')}
+  TOKEN=${TOKEN:-$(ask 'アプリで発行したToken')}
+fi
+
+case "$AGENT_HOST" in *[!A-Za-z0-9.:%_-]*|'') echo '[ERROR] Agentアドレスが不正です。' >&2; exit 14 ;; esac
+case "$AGENT_PORT" in *[!0-9]*|'') echo '[ERROR] Agentポートが不正です。' >&2; exit 15 ;; esac
+if [ "$AGENT_PORT" -lt 1 ] || [ "$AGENT_PORT" -gt 65535 ]; then echo '[ERROR] Agentポートは1〜65535です。' >&2; exit 15; fi
+case "$PROXY_ID" in proxy-[A-Za-z0-9_-]*) ;; *) echo '[ERROR] Proxy IDが不正です。アプリで再発行してください。' >&2; exit 16 ;; esac
+if [ "${#TOKEN}" -lt 24 ]; then echo '[ERROR] Tokenが短すぎます。アプリでProxy登録情報を再発行してください。' >&2; exit 17; fi
+
+tmp=$(mktemp -d 2>/dev/null || mktemp -d -t griefguard-proxy)
+trap 'rm -rf "$tmp"' EXIT INT TERM
+jar="$tmp/GriefGuard-ProxyBridge.jar"
+sums="$tmp/SHA256SUMS"
+download() {
+  url="$1"; output="$2"
+  if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 --connect-timeout 15 "$url" -o "$output"; else wget -q --tries=2 -O "$output" "$url"; fi
+}
+echo "[RUN] GitHubからProxyBridgeを取得しています: $REPOSITORY"
+if ! download "$RELEASE_BASE/GriefGuard-ProxyBridge.jar" "$jar" 2>/dev/null || ! download "$RELEASE_BASE/SHA256SUMS" "$sums" 2>/dev/null; then
+  echo '[INFO] Releasesに見つからないため、リポジトリ直下のファイルを使用します。'
+  download "$RAW_BASE/GriefGuard-ProxyBridge.jar" "$jar"
+  download "$RAW_BASE/SHA256SUMS" "$sums"
+fi
+expected=$(awk '$NF == "GriefGuard-ProxyBridge.jar" || $NF == "*GriefGuard-ProxyBridge.jar" { print $1; exit }' "$sums")
+case "$expected" in [A-Fa-f0-9][A-Fa-f0-9]*) ;; *) echo '[ERROR] SHA256SUMSにProxyBridgeのハッシュがありません。' >&2; exit 18 ;; esac
+case "$(printf '%s' "$expected" | awk '{print length}')" in 64) ;; *) echo '[ERROR] SHA-256の形式が不正です。' >&2; exit 18 ;; esac
+if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$jar" | awk '{print $1}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 "$jar" | awk '{print $1}'); else echo '[ERROR] sha256sumまたはshasumが必要です。' >&2; exit 19; fi
+if [ "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" ]; then echo '[ERROR] ProxyBridgeのSHA-256検証に失敗しました。' >&2; exit 20; fi
+
+if [ "$PLATFORM" = geyser ]; then install_dir="$TARGET/extensions"; data_dir="$install_dir/griefguardproxybridge"; else install_dir="$TARGET/plugins"; if [ "$PLATFORM" = velocity ]; then data_dir="$install_dir/griefguard-proxybridge"; else data_dir="$install_dir/GriefGuard-ProxyBridge"; fi; fi
+mkdir -p "$install_dir" "$data_dir"
+destination="$install_dir/GriefGuard-ProxyBridge.jar"
+if [ -f "$destination" ]; then backup="$destination.backup-$(date -u +%Y%m%dT%H%M%SZ)"; cp "$destination" "$backup"; echo "[OK] 既存JARをバックアップしました: $backup"; fi
+# Stage both artifacts and rename only after the complete copy. A cancelled
+# SSH session must never leave a half-written JAR/config that prevents Proxy
+# startup on the next restart.
+staged_jar="$destination.$$.downloading"
+cp "$jar" "$staged_jar"
+chmod 600 "$staged_jar" 2>/dev/null || true
+mv -f "$staged_jar" "$destination"
+umask 077
+config_file="$data_dir/proxy-config.json"
+if [ -f "$config_file" ]; then config_backup="$config_file.backup-$(date -u +%Y%m%dT%H%M%SZ)"; cp "$config_file" "$config_backup"; echo "[OK] 既存設定をバックアップしました: $config_backup"; fi
+staged_config="$config_file.$$.saving"
+cat > "$staged_config" <<EOF
+{
+  "agentHost": "$(json_escape "$AGENT_HOST")",
+  "agentPort": $AGENT_PORT,
+  "proxyId": "$(json_escape "$PROXY_ID")",
+  "token": "$(json_escape "$TOKEN")",
+  "platform": "$PLATFORM",
+  "edition": "standard",
+  "enabled": true,
+  "failClosed": false,
+  "cacheMaxAgeSeconds": 86400,
+  "autoUpdate": true,
+  "autoApplyOnRestart": true
+}
+EOF
+chmod 600 "$staged_config" 2>/dev/null || true
+mv -f "$staged_config" "$config_file"
+echo "[OK] ${PLATFORM}へProxyBridgeを配置しました: $destination"
+echo "[OK] 設定を保存しました: $config_file"
+echo '[NEXT] Proxyを再起動してください。アプリの「設定 → プロキシ接続管理」でオンラインを確認します。'
