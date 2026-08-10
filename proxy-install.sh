@@ -179,22 +179,22 @@ validate_proxy_root() {
   return 0
 }
 
-discover_root() {
+discover_roots() {
   for candidate in "$(pwd)" "${GRIEFGUARD_PROXY_ROOT:-}"; do
     [ -n "$candidate" ] || continue
     detected=$(detect_platform "$candidate")
-    if [ -n "$detected" ]; then printf '%s' "$candidate"; return 0; fi
+    if [ -n "$detected" ] && ! is_broad_root "$candidate"; then printf '%s\t%s\n' "$candidate" "$detected"; fi
   done
   for base in "$HOME" /home /opt /srv; do
     [ -d "$base" ] || continue
     while IFS= read -r candidate; do
       detected=$(detect_platform "$candidate")
-      if [ -n "$detected" ]; then printf '%s' "$candidate"; return 0; fi
+      if [ -n "$detected" ] && ! is_broad_root "$candidate"; then printf '%s\t%s\n' "$candidate" "$detected"; fi
     done <<EOF
 $(find "$base" -maxdepth 4 \( -type f \( -name velocity.toml -o -name bungee.yml -iname 'velocity*.jar' -o -iname 'waterfall*.jar' -o -iname 'bungeecord*.jar' -o -iname 'Geyser*.jar' \) -o -type d -name extensions \) -print 2>/dev/null | sed 's#/[^/]*$##' | head -20)
 EOF
   done
-  return 1
+  return 0
 }
 
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
@@ -203,13 +203,26 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
 fi
 
 if [ -z "$TARGET" ]; then
-  discovered=$(discover_root || true)
-  detected=$(detect_platform "$discovered")
-  if [ -n "$discovered" ] && [ -n "$detected" ]; then
-    TARGET="$discovered"
-    PLATFORM="$detected"
+  discovered=$(discover_roots | awk 'NF && !seen[$0]++' || true)
+  candidate_count=$(printf '%s\n' "$discovered" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+  if [ "$candidate_count" -eq 1 ]; then
+    TARGET=$(printf '%s\n' "$discovered" | awk -F '\t' 'NR==1{print $1}')
+    PLATFORM=$(printf '%s\n' "$discovered" | awk -F '\t' 'NR==1{print $2}')
     echo "[AUTO] Proxy種類を検出しました: $(platform_label "$PLATFORM")"
     echo "[AUTO] Proxyルートを検出しました: $TARGET"
+  elif [ "$candidate_count" -gt 1 ]; then
+    echo '[INFO] 複数のProxy候補を検出しました。使用する番号を選択してください。' >&2
+    index=1
+    printf '%s\n' "$discovered" | while IFS='\t' read -r candidate candidate_platform; do
+      [ -n "$candidate" ] || continue
+      echo "  $index. $(platform_label "$candidate_platform"): $candidate" >&2
+      index=$((index + 1))
+    done
+    choice=$(ask '使用する番号' '')
+    selected=$(printf '%s\n' "$discovered" | sed -n "${choice}p")
+    TARGET=$(printf '%s' "$selected" | awk -F '\t' '{print $1}')
+    PLATFORM=$(printf '%s' "$selected" | awk -F '\t' '{print $2}')
+    [ -n "$TARGET" ] || { echo '[ERROR] 候補番号が不正です。' >&2; exit 12; }
   else
     platform_guide
     TARGET=$(ask 'Proxyルートフォルダー（例: /home/minecraft/velocity）' '')
