@@ -85,7 +85,20 @@ detect_platform() {
   root="$1"
   if [ -f "$root/velocity.toml" ]; then printf '%s' velocity; return; fi
   if [ -f "$root/bungee.yml" ]; then printf '%s' bungee; return; fi
-  if [ -d "$root/extensions" ] && [ ! -f "$root/bungee.yml" ]; then printf '%s' geyser; return; fi
+  # A generic system directory often contains an "extensions" folder (for
+  # example /opt/homebrew/include/X11).  It is not a Geyser root unless the
+  # folder itself is named Geyser or it contains a Geyser artifact.
+  if [ -d "$root/extensions" ] && [ ! -f "$root/bungee.yml" ]; then
+    case "$(basename "$root")" in
+      [Gg]eyser|[Gg]eyser-*) printf '%s' geyser; return ;;
+    esac
+    for jar in "$root"/*.jar "$root/extensions"/*.jar; do
+      [ -f "$jar" ] || continue
+      case "$(basename "$jar")" in
+        geyser*.jar|Geyser*.jar) printf '%s' geyser; return ;;
+      esac
+    done
+  fi
   if [ -d "$root/plugins" ]; then
     for jar in "$root"/*.jar; do
       name=$(basename "$jar" 2>/dev/null || true)
@@ -122,6 +135,12 @@ Proxyルートフォルダーの選び方:
 
 例: /home/minecraft/velocity、/home/minecraft/waterfall、/home/minecraft/geyser
 EOF
+}
+
+print_discovery_header() {
+  echo '[RUN] Proxyルートフォルダーを自動検索しています…' >&2
+  echo '      Proxy本体の設定ファイル・JAR・plugins/またはextensions/が同じ階層にある場所だけを調べます。' >&2
+  echo '      /root、/home、/opt、/srvなどの親フォルダーは候補にしません。' >&2
 }
 
 has_proxy_jar() {
@@ -197,12 +216,21 @@ EOF
   return 0
 }
 
+# Older launchers used /root as a placeholder. Treat that value as "not set"
+# so an upgrade automatically falls back to the real search instead of
+# installing into an unrelated parent folder.
+if [ -n "$TARGET" ] && is_broad_root "$TARGET"; then
+  echo "[WARN] Proxyルートの初期値 '$TARGET' は親フォルダーのため使用しません。自動検索へ切り替えます。" >&2
+  TARGET=""
+fi
+
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   echo '[ERROR] curlまたはwgetが必要です。Ubuntuなら sudo apt-get install curl を実行してください。' >&2
   exit 11
 fi
 
 if [ -z "$TARGET" ]; then
+  print_discovery_header
   discovered=$(discover_roots | awk 'NF && !seen[$0]++' || true)
   candidate_count=$(printf '%s\n' "$discovered" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
   if [ "$candidate_count" -eq 1 ]; then
@@ -213,17 +241,26 @@ if [ -z "$TARGET" ]; then
   elif [ "$candidate_count" -gt 1 ]; then
     echo '[INFO] 複数のProxy候補を検出しました。使用する番号を選択してください。' >&2
     index=1
-    printf '%s\n' "$discovered" | while IFS='\t' read -r candidate candidate_platform; do
+    tab=$(printf '\t')
+    printf '%s\n' "$discovered" | while IFS="$tab" read -r candidate candidate_platform; do
       [ -n "$candidate" ] || continue
       echo "  $index. $(platform_label "$candidate_platform"): $candidate" >&2
       index=$((index + 1))
     done
     choice=$(ask '使用する番号' '')
+    case "$choice" in
+      ''|*[!0-9]*) echo '[ERROR] 候補番号は表示された数字で指定してください。' >&2; exit 12 ;;
+    esac
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt "$candidate_count" ]; then
+      echo "[ERROR] 候補番号が不正です。1〜$candidate_count の番号を指定してください。" >&2
+      exit 12
+    fi
     selected=$(printf '%s\n' "$discovered" | sed -n "${choice}p")
     TARGET=$(printf '%s' "$selected" | awk -F '\t' '{print $1}')
     PLATFORM=$(printf '%s' "$selected" | awk -F '\t' '{print $2}')
     [ -n "$TARGET" ] || { echo '[ERROR] 候補番号が不正です。' >&2; exit 12; }
   else
+    echo '[INFO] 自動検索で利用可能なProxyルートは見つかりませんでした。' >&2
     platform_guide
     TARGET=$(ask 'Proxyルートフォルダー（例: /home/minecraft/velocity）' '')
   fi
