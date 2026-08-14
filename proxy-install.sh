@@ -12,6 +12,15 @@ RELEASE_BASE="https://github.com/${REPOSITORY}/releases/latest/download"
 RAW_BASE="https://raw.githubusercontent.com/${REPOSITORY}/main"
 PLATFORM=""
 TARGET="${GRIEFGUARD_PROXY_ROOT:-}"
+CREATE_MODE="${GRIEFGUARD_PROXY_CREATE:-0}"
+CREATE_PARENT="${GRIEFGUARD_PROXY_PARENT:-}"
+CREATE_NAME="${GRIEFGUARD_PROXY_NAME:-}"
+LISTEN_PORT="${GRIEFGUARD_PROXY_LISTEN_PORT:-25565}"
+BACKEND_HOST="${GRIEFGUARD_PROXY_BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${GRIEFGUARD_PROXY_BACKEND_PORT:-25566}"
+PROXY_VERSION="${GRIEFGUARD_PROXY_VERSION:-}"
+PROXY_BUILD="${GRIEFGUARD_PROXY_BUILD:-}"
+PROXY_JAR_URL="${GRIEFGUARD_PROXY_JAR_URL:-}"
 AGENT_URL="${GRIEFGUARD_AGENT_URL:-}"
 SETUP_CODE="${GRIEFGUARD_PROXY_SETUP_CODE:-}"
 AGENT_HOST="${GRIEFGUARD_AGENT_HOST:-}"
@@ -32,6 +41,15 @@ Proxyルートは、Proxy本体のJAR・設定ファイル・plugins/またはex
 引数（省略すると画面で質問します）:
   --platform velocity|bungee|geyser
   --target <Proxyルート>
+  --create                         新しいProxyフォルダーを作成（Velocity/Waterfall）
+  --parent <親フォルダー>           新規Proxyの作成先
+  --name <フォルダー名>             新規Proxyフォルダー名
+  --listen-port <1-65535>          Proxy待受ポート（既定25565）
+  --backend-host <ホスト>          接続先Paper（既定127.0.0.1）
+  --backend-port <1-65535>         接続先Paperポート（既定25566）
+  --proxy-version <バージョン>      公式安定版（省略時は最新安定版）
+  --proxy-build <ビルド番号>       公式ビルド（省略時は最新ビルド）
+  --proxy-jar-url <URL>             テスト・ミラー用Proxy JAR
   --agent-url <Agent HTTPS URL>
   --setup-code <アプリ発行の一時コード>
   --agent-host <AgentのTailscale IPまたはDNS>
@@ -55,6 +73,15 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --platform) PLATFORM="${2:-}"; shift 2 ;;
     --target) TARGET="${2:-}"; shift 2 ;;
+    --create|--new) CREATE_MODE=1; shift ;;
+    --parent|--create-parent) CREATE_PARENT="${2:-}"; shift 2 ;;
+    --name) CREATE_NAME="${2:-}"; shift 2 ;;
+    --listen-port) LISTEN_PORT="${2:-}"; shift 2 ;;
+    --backend-host) BACKEND_HOST="${2:-}"; shift 2 ;;
+    --backend-port) BACKEND_PORT="${2:-}"; shift 2 ;;
+    --proxy-version) PROXY_VERSION="${2:-}"; shift 2 ;;
+    --proxy-build) PROXY_BUILD="${2:-}"; shift 2 ;;
+    --proxy-jar-url) PROXY_JAR_URL="${2:-}"; shift 2 ;;
     --agent-url) AGENT_URL="${2:-}"; shift 2 ;;
     --setup-code) SETUP_CODE="${2:-}"; shift 2 ;;
     --agent-host) AGENT_HOST="${2:-}"; shift 2 ;;
@@ -165,6 +192,142 @@ is_broad_root() {
   return 1
 }
 
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+download() {
+  url="$1"; output="$2"
+  if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 --connect-timeout 15 "$url" -o "$output"; else wget -q --tries=2 -O "$output" "$url"; fi
+}
+
+proxy_required_java() {
+  if [ "$1" = velocity ] && printf '%s' "$2" | grep -qE '^4(\.|$)'; then printf '25'; else printf '17'; fi
+}
+
+create_proxy_root() {
+  kind="$1"
+  [ "$kind" = velocity ] || [ "$kind" = bungee ] || { echo '[ERROR] 新規作成はVelocityまたはBungeeCord/Waterfallのみ対応しています。' >&2; return 1; }
+  parent="${CREATE_PARENT:-}"
+  [ -n "$parent" ] || parent=$(ask '新規Proxyの親フォルダー（例: /home/minecraft）' "$(pwd)")
+  valid_dir "$parent" || { echo "[ERROR] 新規Proxyの親フォルダーが見つかりません: $parent" >&2; return 1; }
+  name="${CREATE_NAME:-GriefGuard-Proxy}"
+  case "$name" in ''|.|..|*/*|*\\*) echo '[ERROR] 新規Proxyフォルダー名が不正です。' >&2; return 1 ;; esac
+  if [ -n "$TARGET" ]; then root="$TARGET"; else root="$parent/$name"; fi
+  if [ -e "$root" ]; then
+    [ -d "$root" ] || { echo "[ERROR] 作成先がフォルダーではありません: $root" >&2; return 1; }
+    [ -z "$(find "$root" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || { echo "[ERROR] 新規作成先が空ではありません: $root" >&2; return 1; }
+  else mkdir -p "$root"; fi
+  root=$(CDPATH= cd -- "$root" && pwd)
+  LISTEN_PORT="${LISTEN_PORT:-25565}"; BACKEND_PORT="${BACKEND_PORT:-25566}"; BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
+  case "$LISTEN_PORT:$BACKEND_PORT" in *[!0-9:]*|*:|:*) echo '[ERROR] Proxy/Paperポートは数字で指定してください。' >&2; return 1 ;; esac
+  [ "$LISTEN_PORT" -ge 1 ] && [ "$LISTEN_PORT" -le 65535 ] && [ "$BACKEND_PORT" -ge 1 ] && [ "$BACKEND_PORT" -le 65535 ] || { echo '[ERROR] ポートは1〜65535で指定してください。' >&2; return 1; }
+  case "$BACKEND_HOST" in *[!A-Za-z0-9.%:_-]*) echo '[ERROR] Paper接続先ホストが不正です。' >&2; return 1 ;; esac
+  command -v curl >/dev/null 2>&1 || { echo '[ERROR] 新規Proxy作成にはcurlが必要です。' >&2; return 1; }
+  project="$kind"; [ "$project" = bungee ] && project=waterfall
+  user_agent='GriefGuard-Installer/1.0 (https://github.com/Minato-256/GriefGuard)'
+  if [ -n "$PROXY_JAR_URL" ]; then
+    jar_url="$PROXY_JAR_URL"; version=custom; build=custom
+    jar_name="$(basename "${PROXY_JAR_URL%%\?*}")"; [ "$jar_name" = . ] || [ "$jar_name" = / ] && jar_name="$kind.jar"
+  else
+    project_json=$(curl -fsSL -H "User-Agent: $user_agent" --connect-timeout 15 --max-time 30 "https://fill.papermc.io/v3/projects/$project") || { echo '[ERROR] 公式Proxyのバージョン一覧を取得できませんでした。' >&2; return 1; }
+    version="${PROXY_VERSION:-$(printf '%s' "$project_json" | grep -oE '"[0-9]+(\.[0-9]+){1,3}"' | tr -d '"' | sort -V | tail -1)}"
+    [ -n "$version" ] || { echo '[ERROR] 公式の安定版Proxyバージョンが見つかりません。' >&2; return 1; }
+    case "$version" in *[!0-9.]*) echo '[ERROR] 安定版以外のProxyバージョンは指定できません。' >&2; return 1 ;; esac
+    builds_json=$(curl -fsSL -H "User-Agent: $user_agent" --connect-timeout 15 --max-time 30 "https://fill.papermc.io/v3/projects/$project/versions/$version/builds") || { echo '[ERROR] Proxyビルド一覧を取得できませんでした。' >&2; return 1; }
+    build="${PROXY_BUILD:-$(printf '%s' "$builds_json" | grep -oE '"id":[0-9]+[^}]*"channel":"(STABLE|RECOMMENDED)"' | grep -oE '"id":[0-9]+' | tail -1 | cut -d: -f2)}"
+    server_default=$(printf '%s' "$builds_json" | grep -oE '"server:default":\{.*' | tail -1)
+    jar_name=$(printf '%s' "$server_default" | grep -oE '"name":"[^"}]+\.jar"' | head -1 | sed 's/^"name":"//; s/"$//')
+    [ -n "$build" ] && [ -n "$jar_name" ] || { echo '[ERROR] 公式Proxyビルド情報を解釈できませんでした。' >&2; return 1; }
+    jar_url=$(printf '%s' "$server_default" | grep -oE '"url":"https://[^"]+\.jar"' | head -1 | sed 's/^"url":"//; s/"$//')
+    [ -n "$jar_url" ] || { echo '[ERROR] 公式Proxyのserver:defaultダウンロードURLを取得できませんでした。' >&2; return 1; }
+  fi
+  required_java=$(proxy_required_java "$kind" "$version")
+  echo "[RUN] 公式安定版Proxyを取得しています: $project $version build $build" >&2
+  tmp_jar="$root/.$jar_name.$$.downloading"
+  download "$jar_url" "$tmp_jar" || { rm -f "$tmp_jar"; echo '[ERROR] Proxy本体のダウンロードに失敗しました。' >&2; return 1; }
+  mv -f "$tmp_jar" "$root/$jar_name"; chmod 600 "$root/$jar_name" 2>/dev/null || true
+  mkdir -p "$root/plugins"
+  if [ "$kind" = velocity ]; then
+    cat > "$root/velocity.toml" <<EOF
+config-version = "2.7"
+bind = "0.0.0.0:$LISTEN_PORT"
+motd = "GriefGuard Proxy"
+show-max-players = 20
+online-mode = true
+force-key-authentication = true
+player-info-forwarding-mode = "modern"
+forwarding-secret-file = "forwarding.secret"
+
+[servers]
+try = ["backend"]
+backend = "$BACKEND_HOST:$BACKEND_PORT"
+
+[forced-hosts]
+
+[advanced]
+command-rate-limit = 40
+tab-complete-rate-limit = 20
+
+[query]
+enabled = false
+EOF
+    if command -v od >/dev/null 2>&1; then od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$root/forwarding.secret"; else printf '%s\n' "$(date +%s)-$$-griefguard" > "$root/forwarding.secret"; fi
+    chmod 600 "$root/forwarding.secret"
+  else
+    cat > "$root/config.yml" <<EOF
+forge_support: false
+enable_query: false
+connection_throttle: 4000
+connection_throttle_limit: 3
+ip_forward: true
+online_mode: true
+log_commands: false
+network_compression_threshold: 256
+servers:
+  backend:
+    motd: '&aGriefGuard Backend'
+    address: $BACKEND_HOST:$BACKEND_PORT
+    restricted: false
+listeners:
+- query_port: $LISTEN_PORT
+  motd: '&aGriefGuard Proxy'
+  priorities:
+  - backend
+  host: 0.0.0.0:$LISTEN_PORT
+  max_players: 20
+EOF
+  fi
+  cat > "$root/start-proxy.sh" <<EOF
+#!/bin/sh
+set -eu
+cd "\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
+JAVA_BIN="\${GRIEFGUARD_JAVA_BIN:-java}"
+command -v "\$JAVA_BIN" >/dev/null 2>&1 || { echo "[ERROR] Java ${required_java}以上が必要です。GRIEFGUARD_JAVA_BINまたはPATHを確認してください。" >&2; exit 11; }
+exec "\$JAVA_BIN" -Xms512M -Xmx2G -jar "$jar_name"
+EOF
+  cat > "$root/Start-Proxy.command" <<EOF
+#!/bin/sh
+set -eu
+cd "\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
+JAVA_BIN="\${GRIEFGUARD_JAVA_BIN:-java}"
+command -v "\$JAVA_BIN" >/dev/null 2>&1 || { echo "[ERROR] Java ${required_java}以上が必要です。GRIEFGUARD_JAVA_BINまたはPATHを確認してください。" >&2; exit 11; }
+exec "\$JAVA_BIN" -Xms512M -Xmx2G -jar "$jar_name"
+EOF
+  cat > "$root/Start-Proxy.bat" <<EOF
+@echo off
+cd /d "%~dp0"
+java -Xms512M -Xmx2G -jar "$jar_name"
+if errorlevel 1 pause
+EOF
+  chmod 700 "$root/start-proxy.sh" "$root/Start-Proxy.command"; chmod 600 "$root/Start-Proxy.bat"
+  cat > "$root/griefguard-proxy-setup.json" <<EOF
+{"platform":"$kind","version":"$version","build":"$build","jar":"$jar_name","listenPort":$LISTEN_PORT,"backendHost":"$(json_escape "$BACKEND_HOST")","backendPort":$BACKEND_PORT,"requiresJava":$required_java}
+EOF
+  TARGET="$root"
+  echo "[OK] 新規Proxyを作成しました: $TARGET" >&2
+  echo "[OK] Proxy本体: $jar_name ($version build $build)" >&2
+  echo "[OK] Paper接続先: $BACKEND_HOST:$BACKEND_PORT / 待受: $LISTEN_PORT" >&2
+}
+
 validate_proxy_root() {
   root="$1"
   kind="$2"
@@ -229,7 +392,7 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   exit 11
 fi
 
-if [ -z "$TARGET" ]; then
+if [ "$CREATE_MODE" -ne 1 ] && [ -z "$TARGET" ]; then
   print_discovery_header
   discovered=$(discover_roots | awk 'NF && !seen[$0]++' || true)
   candidate_count=$(printf '%s\n' "$discovered" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
@@ -261,9 +424,24 @@ if [ -z "$TARGET" ]; then
     [ -n "$TARGET" ] || { echo '[ERROR] 候補番号が不正です。' >&2; exit 12; }
   else
     echo '[INFO] 自動検索で利用可能なProxyルートは見つかりませんでした。' >&2
-    platform_guide
-    TARGET=$(ask 'Proxyルートフォルダー（例: /home/minecraft/velocity）' '')
+    mode=$(ask '1: 既存Proxyを選択 / 2: 新規Proxyを作成' '2')
+    if [ "$mode" = 2 ]; then
+      CREATE_MODE=1
+      if [ -z "$PLATFORM" ]; then
+        platform_guide
+        number=$(ask '種類の番号 (1: Velocity / 2: BungeeCord・Waterfall)' '1')
+        case "$number" in 1) PLATFORM=velocity ;; 2) PLATFORM=bungee ;; *) echo '[ERROR] 新規Proxyの種類は1または2です。' >&2; exit 13 ;; esac
+      fi
+    else
+      platform_guide
+      TARGET=$(ask '既存Proxyルート（例: /home/minecraft/velocity）' '')
+    fi
   fi
+fi
+if [ "$CREATE_MODE" -eq 1 ]; then
+  [ "$PLATFORM" = waterfall ] && PLATFORM=bungee
+  [ -n "$PLATFORM" ] || { platform_guide; number=$(ask '種類の番号 (1: Velocity / 2: BungeeCord・Waterfall)' '1'); case "$number" in 1) PLATFORM=velocity ;; 2) PLATFORM=bungee ;; *) echo '[ERROR] 新規Proxyの種類は1または2です。' >&2; exit 13 ;; esac; }
+  create_proxy_root "$PLATFORM" || exit 12
 fi
 if ! valid_dir "$TARGET"; then
   echo "[ERROR] Proxyルートフォルダーが見つかりません: $TARGET" >&2
@@ -285,7 +463,6 @@ esac
 validate_proxy_root "$TARGET" "$PLATFORM" || exit 12
 echo "[OK] $(platform_label "$PLATFORM")として認識しました。" >&2
 
-json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 json_field() {
   value=$(printf '%s' "$2" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1)
   if [ -z "$value" ]; then value=$(printf '%s' "$2" | sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p" | head -1); fi
@@ -326,10 +503,6 @@ tmp=$(mktemp -d 2>/dev/null || mktemp -d -t griefguard-proxy)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 jar="$tmp/GriefGuard-ProxyBridge.jar"
 sums="$tmp/SHA256SUMS"
-download() {
-  url="$1"; output="$2"
-  if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 --connect-timeout 15 "$url" -o "$output"; else wget -q --tries=2 -O "$output" "$url"; fi
-}
 if [ "$OFFLINE" -eq 1 ]; then
   echo '[RUN] 同梱ProxyBridgeを確認しています。'
   script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
