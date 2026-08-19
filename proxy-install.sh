@@ -28,6 +28,8 @@ AGENT_PORT="${GRIEFGUARD_AGENT_PORT:-25502}"
 PROXY_ID="${GRIEFGUARD_PROXY_ID:-}"
 TOKEN="${GRIEFGUARD_PROXY_TOKEN:-}"
 OFFLINE=0
+NO_VERIFY=0
+CONNECTION_TIMEOUT="${GRIEFGUARD_PROXY_CONNECTION_TIMEOUT:-60}"
 
 usage() {
   cat <<'EOF'
@@ -58,6 +60,8 @@ Proxyルートは、Proxy本体のJAR・設定ファイル・plugins/またはex
   --proxy-id <アプリ発行Proxy ID>
   --token <アプリ発行Token>
   --offline                          GitHubへ接続せず、スクリプトと同じフォルダーのJARを使用
+  --no-verify                        Proxyを起動せずAgent接続確認を省略（オフライン検証用）
+  --connection-timeout <秒>          Agent接続確認の待機時間（既定60秒）
   GRIEFGUARD_PROXY_NO_AUTOSTART=1    自動起動登録を省略（既定は有効）
   --help
 
@@ -91,6 +95,8 @@ while [ "$#" -gt 0 ]; do
     --proxy-id) PROXY_ID="${2:-}"; shift 2 ;;
     --token) TOKEN="${2:-}"; shift 2 ;;
     --offline) OFFLINE=1; shift ;;
+    --no-verify) NO_VERIFY=1; shift ;;
+    --connection-timeout) CONNECTION_TIMEOUT="${2:-60}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "[ERROR] 不明な引数です: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -134,9 +140,9 @@ ensure_parent() {
 
 is_legacy_root_file() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
-    griefguard-proxy-setup.json|readme-griefguard-proxy.txt|griefguard-proxy-autostart.json|griefguard-proxy.service|griefguard-proxybridge.jar|forwarding.secret|velocity.toml|bungee.yml|config.yml|start-proxy.sh|start-proxy.command|start-proxy.bat|start-proxy-supervisor.sh|start-proxy-supervisor.command|start-proxy-supervisor.bat|stop-proxy-supervisor.command|stop-proxy-supervisor.bat|griefguard-proxy-supervisor.ps1|.griefguard-proxy-supervisor.pid|.griefguard-proxy-stop) return 0 ;;
+    griefguard-proxy-setup.json|readme-griefguard-proxy.txt|griefguard-proxy-autostart.json|griefguard-proxy.service|griefguard-proxybridge.jar|start-proxy.sh|start-proxy.command|start-proxy.bat|start-proxy-supervisor.sh|start-proxy-supervisor.command|start-proxy-supervisor.bat|stop-proxy-supervisor.command|stop-proxy-supervisor.bat|griefguard-proxy-supervisor.ps1|.griefguard-proxy-supervisor.pid|.griefguard-proxy-stop) return 0 ;;
   esac
-  printf '%s' "$1" | grep -qiE '^(velocity|waterfall|bungeecord|bungee)([-_.].*)?\.jar$'
+  return 1
 }
 
 is_bridge_artifact() {
@@ -156,7 +162,7 @@ prepare_new_proxy_root() {
         for child in "$entry"/* "$entry"/.[!.]*; do
           [ -e "$child" ] || continue
           child_name=$(basename "$child")
-          if is_bridge_artifact "$child_name"; then rm -rf "$child"; else unknown="$unknown $name/$child_name"; fi
+          if [ -f "$child" ] && printf '%s' "$child_name" | grep -qiE '^GriefGuard-ProxyBridge(\.jar)?(\..*)?$'; then rm -f "$child"; else unknown="$unknown $name/$child_name"; fi
         done
         find "$entry" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q . || rmdir "$entry" 2>/dev/null || true
         ;;
@@ -371,6 +377,108 @@ stop_known_autostart() {
   fi
 }
 
+read_managed_proxy_id() {
+  root="$1"
+  for config in "$root/plugins/griefguard-proxybridge/proxy-config.json" "$root/plugins/GriefGuard-ProxyBridge/proxy-config.json" "$root/extensions/griefguardproxybridge/proxy-config.json" "$root/proxy-config.json"; do
+    [ -f "$config" ] || continue
+    id=$(sed -n 's/.*"proxyId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$config" | head -1)
+    token=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$config" | head -1)
+    case "$id:$token" in proxy-[A-Za-z0-9_-]*:????????????????????????*) printf '%s' "$id"; return 0 ;; esac
+  done
+  return 1
+}
+
+is_managed_proxy_root() {
+  root="$1"
+  if read_managed_proxy_id "$root" >/dev/null 2>&1; then return 0; fi
+  for marker in .griefguard-proxy-supervisor.pid .griefguard-proxy-stop start-proxy-supervisor.sh Start-Proxy-Supervisor.command Start-Proxy-Supervisor.bat GriefGuard-Proxy-Supervisor.ps1 griefguard-proxy-autostart.json griefguard-proxy-setup.json; do
+    [ -e "$root/$marker" ] && return 0
+  done
+  for artifact in "$root/plugins/GriefGuard-ProxyBridge.jar" "$root/extensions/GriefGuard-ProxyBridge.jar"; do
+    [ -f "$artifact" ] && return 0
+  done
+  return 1
+}
+
+stop_managed_processes() {
+  root="$1"
+  case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+      if command -v powershell.exe >/dev/null 2>&1; then
+        escaped=$(printf '%s' "$root" | sed "s/'/''/g")
+        powershell.exe -NoLogo -NoProfile -Command "\$root='$escaped'; Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -and \$_.CommandLine.Contains(\$root) -and (\$_.CommandLine -match 'ProxySupervisorMain|start-proxy-supervisor|GriefGuard-Proxy-Supervisor|-jar.*(velocity|waterfall|bungeecord|bungee).*\\.jar') } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
+      fi
+      ;;
+    *)
+      if command -v ps >/dev/null 2>&1; then
+        ps -axo pid=,command= 2>/dev/null | while IFS= read -r row; do
+          pid=$(printf '%s' "$row" | awk '{print $1}')
+          command=$(printf '%s' "$row" | sed 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*//')
+          case "$pid" in ''|*[!0-9]*) continue ;; esac
+          [ "$pid" -gt 1 ] 2>/dev/null || continue
+          case "$command" in *"$root"*) ;; *) continue ;; esac
+          printf '%s' "$command" | grep -Eiq 'ProxySupervisorMain|start-proxy-supervisor|GriefGuard-Proxy-Supervisor|-jar.*(velocity|waterfall|bungeecord|bungee).*\.jar' || continue
+          kill "$pid" 2>/dev/null || true
+        done
+      fi
+      ;;
+  esac
+}
+
+# Stop only GriefGuard's generated Supervisor/runtime registration. Proxy
+# jars/configs, plugin data, reports and login information are preserved.
+stop_managed_root_runtime() {
+  root="$1"
+  is_managed_proxy_root "$root" || return 0
+  stop_known_autostart "$root"
+  stop_managed_processes "$root"
+  for file in start-proxy-supervisor.sh Start-Proxy-Supervisor.command Start-Proxy-Supervisor.bat Stop-Proxy-Supervisor.command Stop-Proxy-Supervisor.bat GriefGuard-Proxy-Supervisor.ps1 .griefguard-proxy-supervisor.pid .griefguard-proxy-stop griefguard-proxy-autostart.json; do
+    rm -f "$root/$file" 2>/dev/null || true
+  done
+  echo "[OK] GriefGuardの旧Supervisorを停止しました（設定・ログイン情報・データは保持）: $root" >&2
+}
+
+# Duplicate roots additionally lose only the generated connector JAR. This
+# prevents the old installation from reconnecting while preserving its
+# credential/config/data files for audit or recovery.
+deactivate_managed_root() {
+  root="$1"
+  stop_managed_root_runtime "$root" || return 0
+  # The duplicate root is inactive now. Remove only files generated by this
+  # installer; retain Proxy jars/configuration and proxy-config.json so login
+  # and pairing data can be recovered later.
+  for file in start-proxy.sh Start-Proxy.command Start-Proxy.bat griefguard-proxy-setup.json README-GriefGuard-Proxy.txt griefguard-proxy-install-result.json; do
+    rm -f "$root/$file" 2>/dev/null || true
+  done
+  if [ -d "$root/logs" ]; then
+    for log in "$root/logs"/proxy-supervisor.log "$root/logs"/proxy-supervisor.log.*; do
+      [ -f "$log" ] || continue
+      rm -f "$log" 2>/dev/null || true
+    done
+    find "$root/logs" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q . || rmdir "$root/logs" 2>/dev/null || true
+  fi
+  rm -f "$root/plugins/GriefGuard-ProxyBridge.jar" "$root/extensions/GriefGuard-ProxyBridge.jar" 2>/dev/null || true
+  echo "[OK] 旧Proxyの重複Connectorを整理しました（設定・ログイン情報・データは保持）: $root" >&2
+}
+
+repair_duplicate_roots() {
+  current_target="$1"
+  proxy_id="$2"
+  discovered=$(discover_roots | awk 'NF && !seen[$0]++' || true)
+  tab=$(printf '\t')
+  current_abs=$(CDPATH= cd -- "$current_target" 2>/dev/null && pwd || true)
+  while IFS="$tab" read -r old_root old_platform; do
+    [ -n "$old_root" ] || continue
+    old_abs=$(CDPATH= cd -- "$old_root" 2>/dev/null && pwd || true)
+    [ -n "$old_abs" ] && [ "$old_abs" != "$current_abs" ] || continue
+    old_id=$(read_managed_proxy_id "$old_abs" 2>/dev/null || true)
+    [ "$old_id" = "$proxy_id" ] || continue
+    deactivate_managed_root "$old_abs"
+  done <<EOF
+$discovered
+EOF
+}
+
 purge_known_proxy_roots() {
   current_target="$1"
   discovered=$(discover_roots | awk 'NF && !seen[$0]++' || true)
@@ -381,9 +489,7 @@ purge_known_proxy_roots() {
     [ -n "$old_abs" ] || continue
     current_abs=$(CDPATH= cd -- "$current_target" 2>/dev/null && pwd || true)
     [ -n "$current_abs" ] && [ "$old_abs" = "$current_abs" ] && continue
-    stop_known_autostart "$old_abs"
-    prepare_new_proxy_root "$old_abs" >/dev/null 2>&1 || true
-    echo "[OK] 旧Proxyの既知ファイルを整理しました: $old_abs" >&2
+    deactivate_managed_root "$old_abs"
   done <<EOF
 $discovered
 EOF
@@ -697,6 +803,35 @@ json_field() {
   printf '%s' "$value"
 }
 
+verify_agent_proxy() {
+  verify_url="$AGENT_URL"
+  [ -n "$verify_url" ] || verify_url="http://$AGENT_HOST:3000"
+  case "$verify_url" in http://*|https://*) ;; *) echo '[ERROR] Agent接続確認URLが不正です。' >&2; return 2 ;; esac
+  payload=$(printf '{"proxyId":"%s","token":"%s"}' "$(json_escape "$PROXY_ID")" "$(json_escape "$TOKEN")")
+  response_file="$tmp/verify-response.json"
+  elapsed=0
+  last=''
+  timeout_seconds="$CONNECTION_TIMEOUT"
+  case "$timeout_seconds" in ''|*[!0-9]*) timeout_seconds=60 ;; esac
+  while [ "$elapsed" -lt "$timeout_seconds" ]; do
+    http_code=$(curl -sS --connect-timeout 5 --max-time 10 -H 'Content-Type: application/json' -d "$payload" -o "$response_file" -w '%{http_code}' "$verify_url/api/proxy/setup/verify" 2>/dev/null || printf '000')
+    body=$(cat "$response_file" 2>/dev/null || true)
+    case "$http_code" in
+      2[0-9][0-9])
+        if printf '%s' "$body" | grep -Eq '"ready"[[:space:]]*:[[:space:]]*true'; then return 0; fi
+        last=$(printf '%s' "$body" | sed -n 's/.*"online"[[:space:]]*:[[:space:]]*\([^,}]*\).*"controlOnline"[[:space:]]*:[[:space:]]*\([^,}]*\).*/plugin=\1 control=\2/p' | head -1)
+        ;;
+      401) echo '[ERROR] Proxy IDまたはTokenが一致しません。アプリでProxy登録情報を再発行してください。' >&2; return 3 ;;
+      404) echo '[ERROR] Agentが接続確認APIに対応していません。Agentを最新版へ更新して再実行してください。' >&2; return 2 ;;
+      *) last="HTTP $http_code" ;;
+    esac
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  echo "[ERROR] Agent接続確認が${timeout_seconds}秒で完了しませんでした。${last:+ 最後の状態: $last}" >&2
+  return 1
+}
+
 if [ -n "$SETUP_CODE" ]; then
   [ -n "$AGENT_URL" ] || { echo '[ERROR] Agent HTTPS URLがありません。アプリで導入コマンドを再発行してください。' >&2; exit 14; }
   case "$AGENT_URL" in http://*|https://*) ;; *) echo '[ERROR] Agent HTTPS URLの形式が不正です。' >&2; exit 14 ;; esac
@@ -726,6 +861,12 @@ case "$AGENT_PORT" in *[!0-9]*|'') echo '[ERROR] Agentポートが不正です�
 if [ "$AGENT_PORT" -lt 1 ] || [ "$AGENT_PORT" -gt 65535 ]; then echo '[ERROR] Agentポートは1〜65535です。' >&2; exit 15; fi
 case "$PROXY_ID" in proxy-[A-Za-z0-9_-]*) ;; *) echo '[ERROR] Proxy IDが不正です。アプリで再発行してください。' >&2; exit 16 ;; esac
 if [ "${#TOKEN}" -lt 24 ]; then echo '[ERROR] Tokenが短すぎます。アプリでProxy登録情報を再発行してください。' >&2; exit 17; fi
+
+# Stop the old Supervisor for the selected root before replacing its JAR. The
+# old connector itself is kept until the backup below is made. Other roots are
+# deactivated only when they carry the same Proxy ID.
+stop_managed_root_runtime "$TARGET"
+repair_duplicate_roots "$TARGET" "$PROXY_ID"
 
 tmp=$(mktemp -d 2>/dev/null || mktemp -d -t griefguard-proxy)
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -845,4 +986,22 @@ EOF
 else
   echo '[INFO] GRIEFGUARD_PROXY_NO_AUTOSTART=1のため常駐登録を省略しました。'
 fi
-echo '[NEXT] 自動起動登録済みの場合はProxyがすぐに起動します。アプリの「設定 → プロキシ接続管理」でオンラインを確認します。'
+
+result_file="$TARGET/griefguard-proxy-install-result.json"
+if [ "${GRIEFGUARD_PROXY_NO_AUTOSTART:-0}" = 1 ]; then
+  printf '{"success":false,"verified":false,"reason":"--no-auto-startが指定されたため未確認","proxyId":"%s","checkedAt":"%s"}\n' "$(json_escape "$PROXY_ID")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$result_file"
+  echo '[WARN] --no-auto-startが指定されたためAgent接続確認を省略しました。Proxyを起動後、アプリでオンライン状態を確認してください。'
+elif [ "$NO_VERIFY" -eq 1 ]; then
+  printf '{"success":false,"verified":false,"reason":"--no-verifyが指定されたため未確認","proxyId":"%s","checkedAt":"%s"}\n' "$(json_escape "$PROXY_ID")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$result_file"
+  echo '[WARN] --no-verifyが指定されたためAgent接続確認を省略しました。Proxy起動後、アプリでオンライン状態を確認してください。'
+else
+  echo '[RUN] AgentとProxyBridgeの接続を確認しています（最大待機時間あり）…'
+  if verify_agent_proxy; then
+    printf '{"success":true,"verified":true,"proxyId":"%s","checkedAt":"%s"}\n' "$(json_escape "$PROXY_ID")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$result_file"
+    echo '[OK] AgentとProxyBridgeの接続を確認しました。インストール完了です。'
+  else
+    printf '{"success":false,"verified":false,"reason":"Agent接続確認に失敗しました","proxyId":"%s","checkedAt":"%s"}\n' "$(json_escape "$PROXY_ID")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$result_file"
+    echo "[ERROR] Proxyは配置しましたが、Agent接続を確認できませんでした。ログ: $TARGET/logs/proxy-supervisor.log" >&2
+    exit 21
+  fi
+fi
