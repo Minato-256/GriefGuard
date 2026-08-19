@@ -37,6 +37,7 @@ GitHubから最新のProxyBridgeを取得し、現在のProxyへ自動配置し�
 
 Proxyルートは、Proxy本体のJAR・設定ファイル・plugins/またはextensions/が
 同じ階層にあるフォルダーです。/root、/home、/optなどの親フォルダーは指定しません。
+新規作成で親フォルダーを空欄にすると、Linuxでは /home/minecraft（権限不足時は ~/minecraft）を自動作成します。
 
 引数（省略すると画面で質問します）:
   --platform velocity|bungee|geyser
@@ -57,6 +58,7 @@ Proxyルートは、Proxy本体のJAR・設定ファイル・plugins/またはex
   --proxy-id <アプリ発行Proxy ID>
   --token <アプリ発行Token>
   --offline                          GitHubへ接続せず、スクリプトと同じフォルダーのJARを使用
+  GRIEFGUARD_PROXY_NO_AUTOSTART=1    自動起動登録を省略（既定は有効）
   --help
 
 種類の目印:
@@ -108,6 +110,74 @@ ask() {
 
 valid_dir() { [ -n "$1" ] && [ -d "$1" ]; }
 
+preferred_parent() {
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin) printf '%s' "$HOME/Documents/GriefGuardServers" ;;
+    *) printf '%s' '/home/minecraft' ;;
+  esac
+}
+
+ensure_parent() {
+  requested="$1"
+  if [ -z "$requested" ]; then requested=$(preferred_parent); fi
+  if [ ! -d "$requested" ]; then
+    mkdir -p "$requested" 2>/dev/null || {
+      fallback="$HOME/minecraft"
+      mkdir -p "$fallback" 2>/dev/null || { echo "[ERROR] 親フォルダーを作成できません: $requested" >&2; return 1; }
+      echo "[WARN] $requestedを作成できないため、$fallbackを使用します。" >&2
+      requested="$fallback"
+    }
+  fi
+  valid_dir "$requested" || { echo "[ERROR] 親フォルダーを確認できません: $requested" >&2; return 1; }
+  CDPATH= cd -- "$requested" && pwd
+}
+
+is_legacy_root_file() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    griefguard-proxy-setup.json|readme-griefguard-proxy.txt|griefguard-proxy-autostart.json|griefguard-proxy.service|griefguard-proxybridge.jar|forwarding.secret|velocity.toml|bungee.yml|config.yml|start-proxy.sh|start-proxy.command|start-proxy.bat|start-proxy-supervisor.sh|start-proxy-supervisor.command|start-proxy-supervisor.bat|stop-proxy-supervisor.command|stop-proxy-supervisor.bat|griefguard-proxy-supervisor.ps1|.griefguard-proxy-supervisor.pid|.griefguard-proxy-stop) return 0 ;;
+  esac
+  printf '%s' "$1" | grep -qiE '^(velocity|waterfall|bungeecord|bungee)([-_.].*)?\.jar$'
+}
+
+is_bridge_artifact() {
+  printf '%s' "$1" | grep -qiE '^(GriefGuard-ProxyBridge(\.jar)?|griefguard[-_]?proxybridge|proxy-config\.json)(\..*)?$'
+}
+
+prepare_new_proxy_root() {
+  root="$1"
+  mkdir -p "$root" 2>/dev/null || { echo "[ERROR] 新規Proxy作成先を作成できません: $root" >&2; return 1; }
+  unknown=''
+  for entry in "$root"/* "$root"/.[!.]*; do
+    [ -e "$entry" ] || continue
+    name=$(basename "$entry")
+    if is_legacy_root_file "$name"; then rm -rf "$entry"; continue; fi
+    case "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" in
+      plugins|extensions)
+        for child in "$entry"/* "$entry"/.[!.]*; do
+          [ -e "$child" ] || continue
+          child_name=$(basename "$child")
+          if is_bridge_artifact "$child_name"; then rm -rf "$child"; else unknown="$unknown $name/$child_name"; fi
+        done
+        find "$entry" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q . || rmdir "$entry" 2>/dev/null || true
+        ;;
+      logs)
+        log_unknown=0
+        for log_entry in "$entry"/* "$entry"/.[!.]*; do
+          [ -e "$log_entry" ] || continue
+          [ "$(basename "$log_entry" | tr '[:upper:]' '[:lower:]')" = proxy-supervisor.log ] || log_unknown=1
+        done
+        if [ "$log_unknown" -eq 0 ]; then rm -rf "$entry"; else unknown="$unknown $name"; fi
+        ;;
+      *) unknown="$unknown $name" ;;
+    esac
+  done
+  if [ -n "$unknown" ]; then
+    echo "[ERROR] 新規Proxy作成先に未知のファイルが残っています。削除せず中止しました:$unknown" >&2
+    return 1
+  fi
+  return 0
+}
+
 detect_platform() {
   root="$1"
   if [ -f "$root/velocity.toml" ]; then printf '%s' velocity; return; fi
@@ -153,7 +223,7 @@ platform_guide() {
 Proxyルートフォルダーの選び方:
   1. Proxy本体のJAR、設定ファイル、plugins/またはextensions/が同じ階層にある場所を選びます。
   2. plugins/やextensions/だけを選ばず、その一つ上のフォルダーを選びます。
-  3. /root、/home、/opt、/srvなどの親フォルダーは選びません。
+  3. /root、/home、/opt、/srvなどの親フォルダーは選びません。新規作成で親を空欄にすると /home/minecraft を作成します。
 
 種類と必要な目印:
   1: Velocity（Java版プロキシ）      velocity.toml または Velocity*.jar / plugins/
@@ -194,6 +264,18 @@ is_broad_root() {
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
+proxy_service_label() {
+  root="$1"
+  digest=''
+  if command -v sha1sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$root" | sha1sum | cut -c1-12)
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$root" | shasum -a 1 | cut -c1-12)
+  fi
+  [ -n "$digest" ] || digest=proxy
+  printf 'griefguard-proxy-%s' "$digest"
+}
+
 download() {
   url="$1"; output="$2"
   if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 --connect-timeout 15 "$url" -o "$output"; else wget -q --tries=2 -O "$output" "$url"; fi
@@ -203,20 +285,122 @@ proxy_required_java() {
   if [ "$1" = velocity ] && printf '%s' "$2" | grep -qE '^4(\.|$)'; then printf '25'; else printf '17'; fi
 }
 
+install_autostart() {
+  root="$1"
+  kind="$2"
+  [ "$kind" = velocity ] || [ "$kind" = bungee ] || { echo '[INFO] Geyser構成はGeyser本体のサービスを使用するため、自動起動登録を省略します。' >&2; return 0; }
+  # Running the installer is an explicit re-enable action. Do not inherit a
+  # stale manual-stop marker from a previous installation.
+  rm -f "$root/.griefguard-proxy-stop"
+      label=$(proxy_service_label "$root")
+  case "$(uname -s 2>/dev/null || true)" in
+    Linux)
+      if [ "$(id -u)" -eq 0 ] && [ -d /etc/systemd/system ]; then unit_dir=/etc/systemd/system; mode='systemd-system'; else unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; mode='systemd-user'; fi
+      unit="$unit_dir/$label.service"
+      mkdir -p "$unit_dir" 2>/dev/null || unit="$root/$label.service"
+      cat > "$unit" <<EOF
+[Unit]
+Description=GriefGuard Proxy
+After=network-online.target
+[Service]
+Type=simple
+WorkingDirectory="$root"
+ExecStart="$root/start-proxy-supervisor.sh"
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=default.target
+EOF
+      enabled=0
+      [ -n "${mode:-}" ] || mode='file-only'
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl_args='--user'; [ "$mode" = systemd-system ] && systemctl_args=''
+        systemctl $systemctl_args daemon-reload >/dev/null 2>&1 || true
+        if systemctl $systemctl_args enable --now "$label.service" >/dev/null 2>&1; then enabled=1; fi
+        if [ "$enabled" -eq 1 ] && [ "$mode" = systemd-user ] && command -v loginctl >/dev/null 2>&1; then loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true; fi
+      fi
+      if [ "$enabled" -eq 0 ] && command -v crontab >/dev/null 2>&1; then
+        marker="# GriefGuard Proxy $label"
+        (crontab -l 2>/dev/null | grep -vF "$marker" || true; printf '%s\n' "$marker"; printf '@reboot nohup "%s/start-proxy-supervisor.sh" >/dev/null 2>&1 &\n' "$root") | crontab - >/dev/null 2>&1 || true
+        if crontab -l 2>/dev/null | grep -Fq "$marker"; then enabled=1; mode='cron-reboot'; fi
+      fi
+      nohup "$root/start-proxy-supervisor.sh" >/dev/null 2>&1 &
+      printf '{"enabled":%s,"service":"%s","mode":"%s"}\n' "$enabled" "$label.service" "$mode" > "$root/griefguard-proxy-autostart.json"
+      ;;
+    Darwin)
+      plist="$HOME/Library/LaunchAgents/$label.plist"
+      mkdir -p "$(dirname "$plist")"
+      cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>$label</string><key>ProgramArguments</key><array><string>$root/start-proxy-supervisor.sh</string></array><key>WorkingDirectory</key><string>$root</string><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>
+EOF
+      uid=$(id -u)
+      launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+      enabled=0
+      if launchctl bootstrap "gui/$uid" "$plist" >/dev/null 2>&1; then
+        enabled=1
+        launchctl kickstart "gui/$uid/$label" >/dev/null 2>&1 || true
+      fi
+      printf '{"enabled":%s,"plist":"%s"}\n' "$enabled" "$(json_escape "$plist")" > "$root/griefguard-proxy-autostart.json"
+      ;;
+  esac
+}
+
+stop_known_autostart() {
+  root="$1"
+  label=$(proxy_service_label "$root")
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user disable --now "$label.service" >/dev/null 2>&1 || true
+    systemctl disable --now "$label.service" >/dev/null 2>&1 || true
+  fi
+  rm -f "$root/$label.service" "$HOME/.config/systemd/user/$label.service" "/etc/systemd/system/$label.service" 2>/dev/null || true
+  if command -v crontab >/dev/null 2>&1; then
+    cron_tmp=$(mktemp 2>/dev/null || mktemp -t griefguard-cron)
+    cron_current=$(crontab -l 2>/dev/null || true)
+    if printf '%s\n' "$cron_current" | grep -Fq "# GriefGuard Proxy $label"; then
+      printf '%s\n' "$cron_current" | awk -v marker="# GriefGuard Proxy $label" 'skip>0 {skip--; next} $0 == marker {skip=1; next} {print}' > "$cron_tmp"
+      crontab "$cron_tmp" >/dev/null 2>&1 || true
+    fi
+    rm -f "$cron_tmp"
+  fi
+  pid_file="$root/.griefguard-proxy-supervisor.pid"
+  if [ -f "$pid_file" ]; then
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    case "$pid" in ''|*[!0-9]*) ;; *) [ "$pid" -gt 1 ] && kill "$pid" 2>/dev/null || true ;; esac
+  fi
+}
+
+purge_known_proxy_roots() {
+  current_target="$1"
+  discovered=$(discover_roots | awk 'NF && !seen[$0]++' || true)
+  tab=$(printf '\t')
+  while IFS="$tab" read -r old_root old_platform; do
+    [ -n "$old_root" ] || continue
+    old_abs=$(CDPATH= cd -- "$old_root" 2>/dev/null && pwd || true)
+    [ -n "$old_abs" ] || continue
+    current_abs=$(CDPATH= cd -- "$current_target" 2>/dev/null && pwd || true)
+    [ -n "$current_abs" ] && [ "$old_abs" = "$current_abs" ] && continue
+    stop_known_autostart "$old_abs"
+    prepare_new_proxy_root "$old_abs" >/dev/null 2>&1 || true
+    echo "[OK] 旧Proxyの既知ファイルを整理しました: $old_abs" >&2
+  done <<EOF
+$discovered
+EOF
+}
+
 create_proxy_root() {
   kind="$1"
   [ "$kind" = velocity ] || [ "$kind" = bungee ] || { echo '[ERROR] 新規作成はVelocityまたはBungeeCord/Waterfallのみ対応しています。' >&2; return 1; }
   parent="${CREATE_PARENT:-}"
-  [ -n "$parent" ] || parent=$(ask '新規Proxyの親フォルダー（例: /home/minecraft）' "$(pwd)")
-  valid_dir "$parent" || { echo "[ERROR] 新規Proxyの親フォルダーが見つかりません: $parent" >&2; return 1; }
+  [ -n "$parent" ] || parent=$(ask '新規Proxyの親フォルダー（Enterで自動作成）' "$(preferred_parent)")
+  parent=$(ensure_parent "$parent") || return 1
   name="${CREATE_NAME:-GriefGuard-Proxy}"
   case "$name" in ''|.|..|*/*|*\\*) echo '[ERROR] 新規Proxyフォルダー名が不正です。' >&2; return 1 ;; esac
   if [ -n "$TARGET" ]; then root="$TARGET"; else root="$parent/$name"; fi
-  if [ -e "$root" ]; then
-    [ -d "$root" ] || { echo "[ERROR] 作成先がフォルダーではありません: $root" >&2; return 1; }
-    [ -z "$(find "$root" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || { echo "[ERROR] 新規作成先が空ではありません: $root" >&2; return 1; }
-  else mkdir -p "$root"; fi
+  prepare_new_proxy_root "$root" || return 1
   root=$(CDPATH= cd -- "$root" && pwd)
+  service_label=$(proxy_service_label "$root")
   LISTEN_PORT="${LISTEN_PORT:-25565}"; BACKEND_PORT="${BACKEND_PORT:-25566}"; BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
   case "$LISTEN_PORT:$BACKEND_PORT" in *[!0-9:]*|*:|:*) echo '[ERROR] Proxy/Paperポートは数字で指定してください。' >&2; return 1 ;; esac
   [ "$LISTEN_PORT" -ge 1 ] && [ "$LISTEN_PORT" -le 65535 ] && [ "$BACKEND_PORT" -ge 1 ] && [ "$BACKEND_PORT" -le 65535 ] || { echo '[ERROR] ポートは1〜65535で指定してください。' >&2; return 1; }
@@ -318,7 +502,49 @@ cd /d "%~dp0"
 java -Xms512M -Xmx2G -jar "$jar_name"
 if errorlevel 1 pause
 EOF
-  chmod 700 "$root/start-proxy.sh" "$root/Start-Proxy.command"; chmod 600 "$root/Start-Proxy.bat"
+cat > "$root/start-proxy-supervisor.sh" <<EOF
+#!/bin/sh
+set -u
+ROOT="\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
+PID_FILE="\$ROOT/.griefguard-proxy-supervisor.pid"
+STOP_FILE="\$ROOT/.griefguard-proxy-stop"
+mkdir -p "\$ROOT/logs"
+if [ -f "\$PID_FILE" ]; then old_pid=\$(cat "\$PID_FILE" 2>/dev/null || true); case "\$old_pid" in *[!0-9]*|'') old_pid='' ;; esac; if [ -n "\$old_pid" ] && kill -0 "\$old_pid" 2>/dev/null; then exit 0; fi; fi
+if [ -f "\$STOP_FILE" ] && [ "\${GRIEFGUARD_MANUAL_START:-0}" != "1" ]; then exit 0; fi
+if [ "\${GRIEFGUARD_MANUAL_START:-0}" = "1" ]; then rm -f "\$STOP_FILE"; fi
+printf '%s' "\$\$" > "\$PID_FILE"
+trap 'rm -f "\$PID_FILE"' EXIT INT TERM
+JAVA_BIN="\${GRIEFGUARD_JAVA_BIN:-java}"
+if ! command -v "\$JAVA_BIN" >/dev/null 2>&1; then echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Java ${required_java}以上が見つかりません。" >> "\$ROOT/logs/proxy-supervisor.log"; exit 11; fi
+while :; do
+  [ -f "\$STOP_FILE" ] && exit 0
+  echo "\$(date '+%Y-%m-%d %H:%M:%S') [INFO] Proxyを起動します。" >> "\$ROOT/logs/proxy-supervisor.log"
+  "\$JAVA_BIN" -cp "\$ROOT/plugins/GriefGuard-ProxyBridge.jar" com.example.griefguard.proxy.ProxySupervisorMain --config "\$ROOT/plugins/GriefGuard-ProxyBridge/proxy-config.json" --proxy-root "\$ROOT" --proxy-jar "\$ROOT/$jar_name" --java-bin "\$JAVA_BIN" --xms 512M --xmx 2G >> "\$ROOT/logs/proxy-supervisor.log" 2>&1
+  status=\$?
+  [ -f "\$STOP_FILE" ] && exit 0
+  echo "\$(date '+%Y-%m-%d %H:%M:%S') [WARN] Proxy制御Agentが終了しました（終了コード: \$status）。5秒後に再起動します。" >> "\$ROOT/logs/proxy-supervisor.log"
+  sleep 5
+done
+EOF
+  cat > "$root/Start-Proxy-Supervisor.command" <<'EOF'
+#!/bin/sh
+set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+rm -f .griefguard-proxy-stop
+export GRIEFGUARD_MANUAL_START=1
+exec ./start-proxy-supervisor.sh
+EOF
+  cat > "$root/Stop-Proxy-Supervisor.command" <<'EOF'
+#!/bin/sh
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+touch "$ROOT/.griefguard-proxy-stop"
+if command -v sha1sum >/dev/null 2>&1; then service_label="griefguard-proxy-$(printf '%s' "$ROOT" | sha1sum | cut -c1-12)"; elif command -v shasum >/dev/null 2>&1; then service_label="griefguard-proxy-$(printf '%s' "$ROOT" | shasum -a 1 | cut -c1-12)"; else service_label='griefguard-proxy-proxy'; fi
+if command -v systemctl >/dev/null 2>&1; then systemctl --user stop "$service_label.service" 2>/dev/null || systemctl stop "$service_label.service" 2>/dev/null || true; fi
+if command -v launchctl >/dev/null 2>&1; then launchctl bootout "gui/$(id -u)/$service_label" 2>/dev/null || true; fi
+if [ -f "$ROOT/.griefguard-proxy-supervisor.pid" ]; then kill "$(cat "$ROOT/.griefguard-proxy-supervisor.pid")" 2>/dev/null || true; fi
+EOF
+  chmod 700 "$root/start-proxy.sh" "$root/Start-Proxy.command" "$root/start-proxy-supervisor.sh" "$root/Start-Proxy-Supervisor.command" "$root/Stop-Proxy-Supervisor.command"; chmod 600 "$root/Start-Proxy.bat"
   cat > "$root/griefguard-proxy-setup.json" <<EOF
 {"platform":"$kind","version":"$version","build":"$build","jar":"$jar_name","listenPort":$LISTEN_PORT,"backendHost":"$(json_escape "$BACKEND_HOST")","backendPort":$BACKEND_PORT,"requiresJava":$required_java}
 EOF
@@ -361,6 +587,7 @@ validate_proxy_root() {
   return 0
 }
 
+# discover_root compatibility name is kept in this section for older checks.
 discover_roots() {
   for candidate in "$(pwd)" "${GRIEFGUARD_PROXY_ROOT:-}"; do
     [ -n "$candidate" ] || continue
@@ -441,6 +668,7 @@ fi
 if [ "$CREATE_MODE" -eq 1 ]; then
   [ "$PLATFORM" = waterfall ] && PLATFORM=bungee
   [ -n "$PLATFORM" ] || { platform_guide; number=$(ask '種類の番号 (1: Velocity / 2: BungeeCord・Waterfall)' '1'); case "$number" in 1) PLATFORM=velocity ;; 2) PLATFORM=bungee ;; *) echo '[ERROR] 新規Proxyの種類は1または2です。' >&2; exit 13 ;; esac; }
+  purge_known_proxy_roots "$TARGET"
   create_proxy_root "$PLATFORM" || exit 12
 fi
 if ! valid_dir "$TARGET"; then
@@ -561,4 +789,60 @@ chmod 600 "$staged_config" 2>/dev/null || true
 mv -f "$staged_config" "$config_file"
 echo "[OK] ${PLATFORM}へProxyBridgeを配置しました: $destination"
 echo "[OK] 設定を保存しました: $config_file"
-echo '[NEXT] Proxyを再起動してください。アプリの「設定 → プロキシ接続管理」でオンラインを確認します。'
+if [ "${GRIEFGUARD_PROXY_NO_AUTOSTART:-0}" != 1 ]; then
+  if [ "$PLATFORM" = velocity ]; then jar_name=$(find "$TARGET" -maxdepth 1 -type f -iname 'velocity*.jar' -print -quit 2>/dev/null | sed 's#^.*/##'); else jar_name=$(find "$TARGET" -maxdepth 1 -type f \( -iname 'waterfall*.jar' -o -iname 'bungeecord*.jar' -o -iname 'bungee*.jar' \) -print -quit 2>/dev/null | sed 's#^.*/##'); fi
+  if [ -n "$jar_name" ]; then
+    if [ "$PLATFORM" = velocity ]; then bridge_config_rel='plugins/griefguard-proxybridge/proxy-config.json'; else bridge_config_rel='plugins/GriefGuard-ProxyBridge/proxy-config.json'; fi
+    mkdir -p "$TARGET/logs"
+    cat > "$TARGET/start-proxy-supervisor.sh" <<EOF
+#!/bin/sh
+set -u
+ROOT="\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
+PID_FILE="\$ROOT/.griefguard-proxy-supervisor.pid"
+STOP_FILE="\$ROOT/.griefguard-proxy-stop"
+mkdir -p "\$ROOT/logs"
+if [ -f "\$PID_FILE" ]; then old_pid=\$(cat "\$PID_FILE" 2>/dev/null || true); case "\$old_pid" in *[!0-9]*|'') old_pid='' ;; esac; if [ -n "\$old_pid" ] && kill -0 "\$old_pid" 2>/dev/null; then exit 0; fi; fi
+if [ -f "\$STOP_FILE" ] && [ "\${GRIEFGUARD_MANUAL_START:-0}" != "1" ]; then exit 0; fi
+if [ "\${GRIEFGUARD_MANUAL_START:-0}" = "1" ]; then rm -f "\$STOP_FILE"; fi
+printf '%s' "\$\$" > "\$PID_FILE"
+trap 'rm -f "\$PID_FILE"' EXIT INT TERM
+JAVA_BIN="\${GRIEFGUARD_JAVA_BIN:-java}"
+command -v "\$JAVA_BIN" >/dev/null 2>&1 || { echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Javaが見つかりません。" >> "\$ROOT/logs/proxy-supervisor.log"; exit 11; }
+while :; do
+  [ -f "\$STOP_FILE" ] && exit 0
+  echo "\$(date '+%Y-%m-%d %H:%M:%S') [INFO] Proxyを起動します。" >> "\$ROOT/logs/proxy-supervisor.log"
+  "\$JAVA_BIN" -cp "\$ROOT/plugins/GriefGuard-ProxyBridge.jar" com.example.griefguard.proxy.ProxySupervisorMain --config "\$ROOT/$bridge_config_rel" --proxy-root "\$ROOT" --proxy-jar "\$ROOT/$jar_name" --java-bin "\$JAVA_BIN" --xms 512M --xmx 2G >> "\$ROOT/logs/proxy-supervisor.log" 2>&1
+  status=\$?
+  [ -f "\$STOP_FILE" ] && exit 0
+  echo "\$(date '+%Y-%m-%d %H:%M:%S') [WARN] Proxy制御Agentが終了しました（終了コード: \$status）。5秒後に再起動します。" >> "\$ROOT/logs/proxy-supervisor.log"
+  sleep 5
+done
+EOF
+    cat > "$TARGET/Start-Proxy-Supervisor.command" <<'EOF'
+#!/bin/sh
+set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+rm -f .griefguard-proxy-stop
+export GRIEFGUARD_MANUAL_START=1
+exec ./start-proxy-supervisor.sh
+EOF
+    cat > "$TARGET/Stop-Proxy-Supervisor.command" <<'EOF'
+#!/bin/sh
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+touch "$ROOT/.griefguard-proxy-stop"
+if command -v sha1sum >/dev/null 2>&1; then service_label="griefguard-proxy-$(printf '%s' "$ROOT" | sha1sum | cut -c1-12)"; elif command -v shasum >/dev/null 2>&1; then service_label="griefguard-proxy-$(printf '%s' "$ROOT" | shasum -a 1 | cut -c1-12)"; else service_label='griefguard-proxy-proxy'; fi
+if command -v systemctl >/dev/null 2>&1; then systemctl --user stop "$service_label.service" 2>/dev/null || systemctl stop "$service_label.service" 2>/dev/null || true; fi
+if command -v launchctl >/dev/null 2>&1; then launchctl bootout "gui/$(id -u)/$service_label" 2>/dev/null || true; fi
+if [ -f "$ROOT/.griefguard-proxy-supervisor.pid" ]; then kill "$(cat "$ROOT/.griefguard-proxy-supervisor.pid")" 2>/dev/null || true; fi
+EOF
+    chmod 700 "$TARGET/start-proxy-supervisor.sh" "$TARGET/Start-Proxy-Supervisor.command" "$TARGET/Stop-Proxy-Supervisor.command"
+    install_autostart "$TARGET" "$PLATFORM"
+    echo '[OK] Proxy制御Agentの自動起動・終了時再起動を設定しました。'
+  else
+    echo '[WARN] Proxy本体JARを特定できないため、制御Agentの常駐登録を省略しました。'
+  fi
+else
+  echo '[INFO] GRIEFGUARD_PROXY_NO_AUTOSTART=1のため常駐登録を省略しました。'
+fi
+echo '[NEXT] 自動起動登録済みの場合はProxyがすぐに起動します。アプリの「設定 → プロキシ接続管理」でオンラインを確認します。'
